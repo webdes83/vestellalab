@@ -1,102 +1,236 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+#===============================================================================
+# auto_note_network.sh
+#
+# Proxmox VM/CT 네트워크·방화벽·MAC·게스트 매칭 현황을 수집하여
+# 기존 description 내 [Auto] network info 영역만 갱신하거나,
+# 없으면 맨 앞에 추가한 뒤 description 필드에 적용
+#
+# Usage: bash auto_note_network.sh [-d|--debug] [-a|--apply] --id <VM/CT ID>
+#===============================================================================
 
-ID="$1"
-[ -z "$ID" ] && echo "Usage: $0 <VMID|CTID>" && exit 1
+set -o errexit
+set -o pipefail
 
-LXC_CONF="/etc/pve/lxc/$ID.conf"
-VM_CONF="/etc/pve/qemu-server/$ID.conf"
-MODE=""
-if [ -f "$LXC_CONF" ]; then
-    MODE="lxc"
-elif [ -f "$VM_CONF" ]; then
-    MODE="vm"
-else
-    echo "Not found: $ID (not LXC nor VM)"
-    exit 1
-fi
+DEBUG=0
+APPLY=0
+ID=""
+TMP_MD=""
+TYPE=""
+CONF_PATH=""
+GUEST_CMD=""
+API_TYPE=""
 
-# 기존 description 읽기
-if [ "$MODE" = "lxc" ]; then
-    OLD_NOTE=$(pct config "$ID" | awk -F': ' '/^description:/ {print substr($0, index($0,$2))}')
-    GET_SVC="pct exec $ID --"
-    GET_FILE="pct exec $ID -- cat"
-else
-    OLD_NOTE=$(qm config "$ID" | awk -F': ' '/^description:/ {print substr($0, index($0,$2))}')
-    GET_SVC="qm guest exec $ID --"
-    GET_FILE="qm guest exec $ID -- cat"
-fi
+echo_usage() {
+  echo "Usage: $0 [-d|--debug] [-a|--apply] --id <VM/CT ID>" >&2
+  exit 1
+}
 
-# 네트워크/브릿지/VLAN 정보 추출
-if [ "$MODE" = "lxc" ]; then
-    NET_LINE=$(grep '^net0:' "$LXC_CONF")
-else
-    NET_LINE=$(grep '^net0:' "$VM_CONF")
-fi
-BRIDGE=$(echo "$NET_LINE" | grep -oP 'bridge=\\K[^,]+')
-VLAN=$(echo "$NET_LINE" | grep -oP 'tag=\\K[0-9]+')
-IPINFO=$($GET_SVC bash -c "ip -4 -o addr show | grep -v '127\\.0\\.0\\.1' | awk '{print \$2\": \"\$4}'" 2>/dev/null)
-
-# 서비스 및 소스 정보 (서비스별로 영역 생성)
-SERVICES="openresty npm lamp node pm2"
-SERVICE_INFO=""
-for s in $SERVICES; do
-    STATUS=$($GET_SVC systemctl is-active "$s".service 2>/dev/null || true)
-    # 예시: 소스 정보 가져오기 (없으면 -로 표시)
-    SRC_MARK="-"
-    if [ "$s" = "openresty" ]; then
-        SRC_MARK=$($GET_FILE /etc/openresty/nginx.conf 2>/dev/null | grep -E 'server_name|server {' | xargs 2>/dev/null || echo "-")
-    elif [ "$s" = "lamp" ]; then
-        SRC_MARK=$($GET_FILE /etc/apache2/sites-enabled/000-default.conf 2>/dev/null | grep -E 'ServerName|ServerAlias|DocumentRoot' | xargs 2>/dev/null || echo "-")
-    elif [ "$s" = "npm" ]; then
-        SRC_MARK=$($GET_FILE /opt/npm/.env 2>/dev/null | grep -v '^#' | xargs 2>/dev/null || echo "-")
-    elif [ "$s" = "node" ]; then
-        SRC_MARK=$($GET_SVC pm2 list 2>/dev/null | head -n 20 | xargs 2>/dev/null || echo "-")
-    fi
-    [ -z "$SRC_MARK" ] && SRC_MARK="-"
-    if [ "$STATUS" = "active" ]; then
-        SERVICE_INFO+="$s: active\n[소스 정보]\n$SRC_MARK\n\n"
-    else
-        SERVICE_INFO+="$s: inactive\n[소스 정보]\n$SRC_MARK\n\n"
-    fi
+# 옵션 파싱
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--debug)   DEBUG=1; shift ;;
+    -a|--apply)   APPLY=1; shift ;;
+    --id)
+      [[ -n "$2" ]] && { ID="$2"; shift 2; } || echo_usage ;;
+    *) echo_usage ;;
+  esac
 done
+[[ -z "$ID" ]] && echo_usage
+(( DEBUG == 1 )) && set -x
 
-CRONTAB_LIST=$($GET_SVC bash -c "for user in \$(cut -f1 -d: /etc/passwd); do crontab -u \$user -l 2>/dev/null | grep -q . && echo \$user; done" 2>/dev/null)
-[ -n "$CRONTAB_LIST" ] && SERVICE_INFO+="crontab: $CRONTAB_LIST\n"
+TMP_MD="/tmp/proxmox_net_${ID}.md"
 
-NEW_HEADER="### [Auto] 네트워크 정보\n$IPINFO (bridge: $BRIDGE, vlan: $VLAN)\n\n### [Auto] 서비스/소스 상태\n$SERVICE_INFO---\n"
-
-# 기존 note에서 고정영역과 나머지 영역 분리
-if echo "$OLD_NOTE" | grep -q '^### \[Auto\]'; then
-    EXIST_AUTO=$(echo "$OLD_NOTE" | awk 'BEGIN{a=0} /^### \\[Auto\\]/ {a=1} a{print} /^---$/ {a=0}')
-    REST_NOTE=$(echo "$OLD_NOTE" | awk 'BEGIN{a=0} /^---$/ {a=1; next} a{print}')
+# VM vs CT 판별
+if [[ -f "/etc/pve/qemu-server/${ID}.conf" ]]; then
+  TYPE="VM"
+  CONF_PATH="/etc/pve/qemu-server/${ID}.conf"
+  GUEST_CMD="qm guest exec ${ID} --"
+  API_TYPE="qemu"
+elif [[ -f "/etc/pve/lxc/${ID}.conf" ]]; then
+  TYPE="CT"
+  CONF_PATH="/etc/pve/lxc/${ID}.conf"
+  GUEST_CMD="pct exec ${ID} --"
+  API_TYPE="lxc"
 else
-    EXIST_AUTO=""
-    REST_NOTE="$OLD_NOTE"
+  echo "[ERROR] No VM or CT configuration found for ID ${ID}" >&2
+  exit 1
 fi
 
-# diff 및 strikethrough
-if [ -n "$EXIST_AUTO" ]; then
-    DIFF_RESULT=$(
-        diff -u <(echo "$EXIST_AUTO") <(echo -e "$NEW_HEADER") | \
-        awk '
-            /^-/ && !/^-{3}/ {print "~~" substr($0,2) "~~"}
-            /^[+]/ && !/^\+\+\+/ {print substr($0,2)}
-            /^[^+-]/ {if($0!~/^@/)print}
-        '
-    )
-    HEADER="$DIFF_RESULT"
+# Proxmox node & config JSON 한 번만 조회
+NODE=$(hostname -s)
+CONFIG_JSON=$(
+  pvesh get /nodes/"$NODE"/"$API_TYPE"/"$ID"/config \
+    --output-format=json
+)
+
+# GUEST_NAME 및 기존 description 추출
+GUEST_NAME=$(echo "$CONFIG_JSON" | jq -r '.name // ""')
+EXISTING=$(echo "$CONFIG_JSON"  | jq -r '.description // ""')
+
+# 방화벽 상태 함수
+echo_firewall() {
+  fw_file="/etc/pve/firewall/${ID}.fw"
+  if [[ ! -f "$fw_file" ]]; then
+    echo "enable:❌ policy_in:✅ policy_out:✅"
+    return
+  fi
+  grep -q '^enable:[[:space:]]*1' "$fw_file" && enable=✅ || enable=❌
+  grep -q '^policy_in:.*DROP'  "$fw_file" && policy_in=❌ || policy_in=✅
+  grep -q '^policy_out:.*DROP' "$fw_file" && policy_out=❌ || policy_out=✅
+  echo "enable:${enable} policy_in:${policy_in} policy_out:${policy_out}"
+}
+
+declare -A guest_map guest_content
+
+parse_guest_config() {
+  #
+  # Netplan (*.yaml 만)
+  #
+  raw_ls=$($GUEST_CMD bash -lc "ls /etc/netplan/*.yaml" 2>/dev/null)
+  code=$(echo "$raw_ls" | jq -r '.exitcode // 1')
+  if [[ $code -eq 0 ]]; then
+    files=$(echo "$raw_ls" | jq -r '."out-data"' | sed '/^$/d')
+    IFS=$'\n' read -r -a arr <<< "$files"
+    for name in "${arr[@]}"; do
+      path="/etc/netplan/$name"
+      raw_cat=$($GUEST_CMD bash -lc "cat '$path'" 2>/dev/null)
+      code=$(echo "$raw_cat" | jq -r '.exitcode // 1')
+      [[ $code -ne 0 ]] && continue
+      content=$(echo "$raw_cat" | jq -r '."out-data"')
+      guest_content["$path"]="$content"
+
+      echo "$content" \
+        | yq eval -j - 2>/dev/null \
+        | jq -r '
+            .network.ethernets // {}
+          | to_entries[]
+          | "\(.value.networkmanager.name // \"legacy\"):\(.key)|\((.value.routes // [] | length)>0)"' \
+        | while IFS='|' read -r idf has; do
+            iface=${idf#*:}
+            macj=$($GUEST_CMD bash -lc "cat /sys/class/net/${iface}/address")
+            mac=$(echo "$macj" | jq -r '."out-data" // empty' | tr '[:upper:]' '[:lower:]' | tr -d '\n')
+            guest_map[$mac]="$idf|$has|$path"
+          done
+    done
+  fi
+
+  #
+  # NetworkManager (*.nmconnection 만)
+  #
+  raw_nm=$($GUEST_CMD bash -lc "ls /etc/NetworkManager/system-connections/*.nmconnection" 2>/dev/null)
+  code=$(echo "$raw_nm" | jq -r '.exitcode // 1')
+  if [[ $code -eq 0 ]]; then
+    files=$(echo "$raw_nm" | jq -r '."out-data"' | sed '/^$/d')
+    IFS=$'\n' read -r -a arr <<< "$files"
+    for f in "${arr[@]}"; do
+      raw_cat=$($GUEST_CMD bash -lc "cat '$f'" 2>/dev/null)
+      code=$(echo "$raw_cat" | jq -r '.exitcode // 1')
+      [[ $code -ne 0 ]] && continue
+      content=$(echo "$raw_cat" | jq -r '."out-data"')
+      guest_content["$f"]="$content"
+
+      id=$(grep -m1 '^id=' <<< "$content" | cut -d= -f2)
+      iface=$(grep -m1 '^interface-name=' <<< "$content" | cut -d= -f2)
+      has=$(grep -q '^routes=' <<< "$content" && echo "true" || echo "false")
+      macj=$($GUEST_CMD bash -lc "cat /sys/class/net/${iface}/address")
+      mac=$(echo "$macj" | jq -r '."out-data" // empty' | tr '[:upper:]' '[:lower:]' | tr -d '\n')
+      guest_map[$mac]="$id:$iface|$has|$f"
+    done
+  fi
+
+  #
+  # /etc/network/interfaces (up route / post-up ip route)
+  #
+  raw_intf=$($GUEST_CMD bash -lc "cat /etc/network/interfaces" 2>/dev/null)
+  code=$(echo "$raw_intf" | jq -r '.exitcode // 1')
+  if [[ $code -eq 0 ]]; then
+    content=$(echo "$raw_intf" | jq -r '."out-data"')
+    guest_content["/etc/network/interfaces"]="$content"
+    echo "$content" \
+      | awk '
+          /^iface/ { ifc=$2 }
+          /^(up route|post-up ip route)/ { has[ifc]=1 }
+          END { for (i in has) print "legacy:" i "|" has[i] }' \
+      | while IFS='|' read -r idf has; do
+          iface=${idf#*:}
+          macj=$($GUEST_CMD bash -lc "cat /sys/class/net/${iface}/address")
+          mac=$(echo "$macj" | jq -r '."out-data" // empty' | tr '[:upper:]' '[:lower:]' | tr -d '\n')
+          r=$([[ "$has" -eq 1 ]] && echo "true" || echo "false")
+          guest_map[$mac]="$idf|$r|/etc/network/interfaces"
+        done
+  fi
+}
+
+generate_markdown() {
+  cat > "$TMP_MD" <<-EOF
+<!-- BEGIN_AUTO_NETWORK_INFO -->
+
+---
+
+### [Auto] network info
+
+**firewall-cfg:** $(echo_firewall)
+
+#### ${ID} ${GUEST_NAME} ${TYPE}
+
+EOF
+
+  grep -E '^net[0-9]+' "$CONF_PATH" | while IFS= read -r line; do
+    dev=$(cut -d: -f1 <<<"$line")
+    props=$(sed 's/,/ /g' <<<"$line")
+    bridge=$(grep -Po '(?<=bridge=)[^ ]+' <<<"$props" || echo '❌')
+    vlan=$(grep -Po '(?<=tag=)[^ ]+'    <<<"$props" || echo '❌')
+    mac=$(grep -Po '(?<=virtio=|hwaddr=|mac=)[0-9A-Fa-f:]+' <<<"$props" | tr '[:upper:]' '[:lower:]')
+
+    entry=${guest_map[$mac]:-"_:false|"}
+    idf=${entry%%|*}
+    has=${entry#*|}
+    route_flag=$([[ "$has" == "true" ]] && echo '✅' || echo '❌')
+    src=${entry##*|}
+
+    if [[ -n "$src" && -n "${guest_content[$src]}" ]]; then
+      cat >> "$TMP_MD" <<-DETAIL
+
+<details><summary>${dev} | ${bridge}:${vlan} | ${idf} | routes=${route_flag}</summary>
+
+filepath: $src
+\`\`\`text
+$(echo "${guest_content[$src]}" | sed 's/^/    /')
+\`\`\`
+
+</details>
+
+DETAIL
+    fi
+  done
+
+  cat >> "$TMP_MD" <<-'EOF'
+---
+
+<!-- END_AUTO_NETWORK_INFO -->
+EOF
+}
+
+# main
+parse_guest_config
+generate_markdown
+
+if (( APPLY == 1 )); then
+  # 공백 없이 TMP_MD 그대로 읽어들임
+  NEW_SEC=$(cat "$TMP_MD")
+
+  if grep -q '<!-- BEGIN_AUTO_NETWORK_INFO -->' <<<"$EXISTING"; then
+    PREFIX=$(printf '%s\n' "$EXISTING" | sed '/<!-- BEGIN_AUTO_NETWORK_INFO -->/,$d')
+    SUFFIX=$(printf '%s\n' "$EXISTING" | sed -n '/<!-- END_AUTO_NETWORK_INFO -->/,$p' | sed '1d')
+    MERGED="${PREFIX}"$'\n'"${NEW_SEC}"$'\n'"${SUFFIX}"
+  else
+    MERGED="${NEW_SEC}"$'\n'"${EXISTING}"
+  fi
+
+  pvesh set /nodes/"$NODE"/"$API_TYPE"/"$ID"/config \
+    --description "$MERGED"
+  echo "[DONE] description updated"
 else
-    HEADER="$NEW_HEADER"
+  cat "$TMP_MD"
 fi
-
-FINAL_NOTE="${HEADER}\n${REST_NOTE}"
-
-# description 반영
-if [ "$MODE" = "lxc" ]; then
-    pct set "$ID" -description "$FINAL_NOTE"
-else
-    qm set "$ID" -description "$FINAL_NOTE"
-fi
-
-echo "✅ Note updated for $MODE $ID"

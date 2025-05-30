@@ -32,16 +32,28 @@ curl -fsSL https://raw.githubusercontent.com/webdes83/vestellalab/refs/heads/mai
 
 ### `proxmox/auto_note_network.sh`
 
-Proxmox LXC/VM의 Notes(설명) 영역에 네트워크 정보를 자동으로 반영합니다.
+Proxmox VM/CT 네트워크·방화벽·MAC·게스트 인터페이스 매핑 정보를 수집하여  
+Markdown 형식으로 출력하거나 VM/CT description 필드에 자동 반영해 주는 스크립트입니다.
 
-- LXC와 VM 모두 지원 (ID로 자동 판별)
-- 맨 위 `[Auto] 네트워크 정보` 영역만 덮어쓰고, 아래 기존 Note는 그대로 보존
-- VM의 경우 `/etc/NetworkManager/system-connections/*` 내 커스텀 라우팅·IP 등도 노출
-- 변경사항은 diff와 ~~취소선~~으로 표시
+---
+
+## 요구사항
+
+- bash (Associative Array 지원)
+- `jq` (JSON 파싱)
+- `yq` (YAML → JSON 변환)
+- Proxmox CLI 도구: `pvesh`, `qm`, `pct`
+- Proxmox VE 7.x 이상
+
+---
+
+## 설치 및 실행
 
 **사용 예시:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/webdes83/vestellalab/refs/heads/main/proxmox/auto_note_network.sh | bash -s -- <VMID|CTID>
+# 디버그 모드 + 적용: ID가 103인 VM, 실행 로그와 함께 description 갱신
+curl -fsSL https://raw.githubusercontent.com/webdes83/vestellalab/main/proxmox/auto_note_network.sh \
+  | bash -s -- -d -a --id 103 <VMID|CTID>
 ```
 
 ### 기여 안내
