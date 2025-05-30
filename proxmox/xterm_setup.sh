@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VMID="$1"
+VMID="${1:-$2}"
 
 if [ -z "$VMID" ]; then
     echo "Usage: xterm_setup.sh <VMID>"
