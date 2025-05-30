@@ -2,7 +2,7 @@
 #===============================================================================
 # auto_note_network.sh
 #
-# Proxmox VM/CT 네트워크·방화벽·MAC·게스트 매칭 현황을 수집하여
+# Proxmox VM/CT 네트워크·방화벽·MAC·게스트 인터페이스 매핑 정보를 수집하여
 # 기존 description 내 [Auto] network info 영역만 갱신하거나,
 # 없으면 맨 앞에 추가한 뒤 description 필드에 적용
 #
@@ -68,9 +68,21 @@ CONFIG_JSON=$(
 GUEST_NAME=$(echo "$CONFIG_JSON" | jq -r '.name // ""')
 EXISTING=$(echo "$CONFIG_JSON"  | jq -r '.description // ""')
 
+# 게스트 명령을 JSON 형태(exitcode, out-data)로 래핑
+guest_exec() {
+  local cmd="$*"
+  local raw out data exitcode
+  raw=$($GUEST_CMD bash -lc "$cmd" 2>&1) || true
+  exitcode=$?
+  data=$(printf '%s' "$raw" \
+           | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+                 -e ':a;N;s/\n/\\n/g;ta')
+  printf '{"exitcode":%d,"out-data":"%s"}' "$exitcode" "$data"
+}
+
 # 방화벽 상태 함수
 echo_firewall() {
-  fw_file="/etc/pve/firewall/${ID}.fw"
+  local fw_file="/etc/pve/firewall/${ID}.fw"
   if [[ ! -f "$fw_file" ]]; then
     echo "enable:❌ policy_in:✅ policy_out:✅"
     return
@@ -84,18 +96,18 @@ echo_firewall() {
 declare -A guest_map guest_content
 
 parse_guest_config() {
-  #
   # 1) Netplan (*.yaml 만)
-  #
-  raw_ls=$($GUEST_CMD bash -lc "ls /etc/netplan/*.yaml 2>/dev/null || true")
-  code=$(echo "$raw_ls" | jq -r '.exitcode // 1')
+  local raw_ls files code
+  raw_ls=$(guest_exec "ls /etc/netplan/*.yaml 2>/dev/null || true")
+  code=$(echo "$raw_ls" | jq -r '.exitcode')
   if [[ $code -eq 0 ]]; then
     files=$(echo "$raw_ls" | jq -r '."out-data"' | sed '/^$/d')
-    IFS=$'\n' read -r -a arr <<< "$files"
-    for name in "${arr[@]}"; do
-      path="/etc/netplan/$name"
-      raw_cat=$($GUEST_CMD bash -lc "cat '$path'" 2>/dev/null)
-      code=$(echo "$raw_cat" | jq -r '.exitcode // 1')
+    IFS=$'\n' read -r -a files <<< "$files"
+    for name in "${files[@]}"; do
+      local path="/etc/netplan/$name"
+      local raw_cat content
+      raw_cat=$(guest_exec "cat '$path'")
+      code=$(echo "$raw_cat" | jq -r '.exitcode')
       [[ $code -ne 0 ]] && continue
       content=$(echo "$raw_cat" | jq -r '."out-data"')
       guest_content["$path"]="$content"
@@ -104,28 +116,30 @@ parse_guest_config() {
         | yq eval -j - 2>/dev/null \
         | jq -r '
             .network.ethernets // {}
-          | to_entries[]
-          | "\(.value.networkmanager.name // \"legacy\"):\(.key)|\((.value.routes // [] | length)>0)"' \
+            | to_entries[]
+            | "\(.value.networkmanager.name // \"legacy\"):\(.key)|\((.value.routes // [] | length)>0)"' \
         | while IFS='|' read -r idf has; do
-            iface=${idf#*:}
-            macj=$($GUEST_CMD bash -lc "cat /sys/class/net/${iface}/address")
-            mac=$(echo "$macj" | jq -r '."out-data" // empty' | tr '[:upper:]' '[:lower:]' | tr -d '\n')
+            local iface=${idf#*:}
+            local raw_mac mac
+            raw_mac=$(guest_exec "cat /sys/class/net/${iface}/address")
+            mac=$(echo "$raw_mac" | jq -r '."out-data" // empty' \
+                  | tr '[:upper:]' '[:lower:]' | tr -d '\n')
             guest_map[$mac]="$idf|$has|$path"
           done
     done
   fi
 
-  #
   # 2) NetworkManager (*.nmconnection 만)
-  #
-  raw_nm=$($GUEST_CMD bash -lc "ls /etc/NetworkManager/system-connections/*.nmconnection 2>/dev/null || true")
-  code=$(echo "$raw_nm" | jq -r '.exitcode // 1')
+  local raw_nm
+  raw_nm=$(guest_exec "ls /etc/NetworkManager/system-connections/*.nmconnection 2>/dev/null || true")
+  code=$(echo "$raw_nm" | jq -r '.exitcode')
   if [[ $code -eq 0 ]]; then
     files=$(echo "$raw_nm" | jq -r '."out-data"' | sed '/^$/d')
-    IFS=$'\n' read -r -a arr <<< "$files"
-    for f in "${arr[@]}"; do
-      raw_cat=$($GUEST_CMD bash -lc "cat '$f'" 2>/dev/null)
-      code=$(echo "$raw_cat" | jq -r '.exitcode // 1')
+    IFS=$'\n' read -r -a files <<< "$files"
+    for f in "${files[@]}"; do
+      local raw_cat content id iface has
+      raw_cat=$(guest_exec "cat '$f'")
+      code=$(echo "$raw_cat" | jq -r '.exitcode')
       [[ $code -ne 0 ]] && continue
       content=$(echo "$raw_cat" | jq -r '."out-data"')
       guest_content["$f"]="$content"
@@ -133,17 +147,17 @@ parse_guest_config() {
       id=$(grep -m1 '^id=' <<< "$content" | cut -d= -f2)
       iface=$(grep -m1 '^interface-name=' <<< "$content" | cut -d= -f2)
       has=$(grep -q '^routes=' <<< "$content" && echo "true" || echo "false")
-      macj=$($GUEST_CMD bash -lc "cat /sys/class/net/${iface}/address")
-      mac=$(echo "$macj" | jq -r '."out-data" // empty' | tr '[:upper:]' '[:lower:]' | tr -d '\n')
+      raw_mac=$(guest_exec "cat /sys/class/net/${iface}/address")
+      mac=$(echo "$raw_mac" | jq -r '."out-data" // empty' \
+            | tr '[:upper:]' '[:lower:]' | tr -d '\n')
       guest_map[$mac]="$id:$iface|$has|$f"
     done
   fi
 
-  #
   # 3) /etc/network/interfaces (up route / post-up ip route)
-  #
-  raw_intf=$($GUEST_CMD bash -lc "cat /etc/network/interfaces" 2>/dev/null)
-  code=$(echo "$raw_intf" | jq -r '.exitcode // 1')
+  local raw_intf content
+  raw_intf=$(guest_exec "cat /etc/network/interfaces")
+  code=$(echo "$raw_intf" | jq -r '.exitcode')
   if [[ $code -eq 0 ]]; then
     content=$(echo "$raw_intf" | jq -r '."out-data"')
     guest_content["/etc/network/interfaces"]="$content"
@@ -153,9 +167,10 @@ parse_guest_config() {
           /^(up route|post-up ip route)/ { has[ifc]=1 }
           END { for (i in has) print "legacy:" i "|" has[i] }' \
       | while IFS='|' read -r idf has; do
-          iface=${idf#*:}
-          macj=$($GUEST_CMD bash -lc "cat /sys/class/net/${iface}/address")
-          mac=$(echo "$macj" | jq -r '."out-data" // empty' | tr '[:upper:]' '[:lower:]' | tr -d '\n')
+          local raw_mac mac r
+          raw_mac=$(guest_exec "cat /sys/class/net/${idf#*:}/address")
+          mac=$(echo "$raw_mac" | jq -r '."out-data" // empty' \
+                | tr '[:upper:]' '[:lower:]' | tr -d '\n')
           r=$([[ "$has" -eq 1 ]] && echo "true" || echo "false")
           guest_map[$mac]="$idf|$r|/etc/network/interfaces"
         done
@@ -176,12 +191,14 @@ generate_markdown() {
 EOF
 
   grep -E '^net[0-9]+' "$CONF_PATH" | while IFS= read -r line; do
+    local dev props bridge vlan entry idf has route_flag src
     dev=$(cut -d: -f1 <<<"$line")
     props=$(sed 's/,/ /g' <<<"$line")
     bridge=$(grep -Po '(?<=bridge=)[^ ]+' <<<"$props" || echo '❌')
     vlan=$(grep -Po '(?<=tag=)[^ ]+'    <<<"$props" || echo '❌')
 
-    entry=${guest_map[$(grep -Po '(?<=virtio=|hwaddr=|mac=)[0-9A-Fa-f:]+' <<<"$props" | tr '[:upper:]' '[:lower:]')]:-"_:false|"}
+    entry=${guest_map[$(grep -Po '(?<=virtio=|hwaddr=|mac=)[0-9A-Fa-f:]+' \
+              <<<"$props" | tr '[:upper:]' '[:lower:]')]:-"_:false|"}
     idf=${entry%%|*}
     has=${entry#*|}
     route_flag=$([[ "$has" == "true" ]] && echo '✅' || echo '❌')
@@ -218,7 +235,7 @@ if (( APPLY == 1 )); then
   if grep -q '<!-- BEGIN_AUTO_NETWORK_INFO -->' <<<"$EXISTING"; then
     PREFIX=$(printf '%s\n' "$EXISTING" | sed '/<!-- BEGIN_AUTO_NETWORK_INFO -->/,$d')
     SUFFIX=$(printf '%s\n' "$EXISTING" | sed -n '/<!-- END_AUTO_NETWORK_INFO -->/,$p' | sed '1d')
-    MERGED="${PREFIX}"$'\n'"${NEW_SEC}"$'\n'"${SUFFIX}"
+    MERGED="${PREFIX}"$'\n'"${NEW_SEC}"$'\n'"("${SUFFIX}")"
   else
     MERGED="${NEW_SEC}"$'\n'"${EXISTING}"
   fi
