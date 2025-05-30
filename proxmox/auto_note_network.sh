@@ -85,9 +85,9 @@ declare -A guest_map guest_content
 
 parse_guest_config() {
   #
-  # Netplan (*.yaml 만)
+  # 1) Netplan (*.yaml 만)
   #
-  raw_ls=$($GUEST_CMD bash -lc "ls /etc/netplan/*.yaml" 2>/dev/null)
+  raw_ls=$($GUEST_CMD bash -lc "ls /etc/netplan/*.yaml 2>/dev/null || true")
   code=$(echo "$raw_ls" | jq -r '.exitcode // 1')
   if [[ $code -eq 0 ]]; then
     files=$(echo "$raw_ls" | jq -r '."out-data"' | sed '/^$/d')
@@ -116,9 +116,9 @@ parse_guest_config() {
   fi
 
   #
-  # NetworkManager (*.nmconnection 만)
+  # 2) NetworkManager (*.nmconnection 만)
   #
-  raw_nm=$($GUEST_CMD bash -lc "ls /etc/NetworkManager/system-connections/*.nmconnection" 2>/dev/null)
+  raw_nm=$($GUEST_CMD bash -lc "ls /etc/NetworkManager/system-connections/*.nmconnection 2>/dev/null || true")
   code=$(echo "$raw_nm" | jq -r '.exitcode // 1')
   if [[ $code -eq 0 ]]; then
     files=$(echo "$raw_nm" | jq -r '."out-data"' | sed '/^$/d')
@@ -140,7 +140,7 @@ parse_guest_config() {
   fi
 
   #
-  # /etc/network/interfaces (up route / post-up ip route)
+  # 3) /etc/network/interfaces (up route / post-up ip route)
   #
   raw_intf=$($GUEST_CMD bash -lc "cat /etc/network/interfaces" 2>/dev/null)
   code=$(echo "$raw_intf" | jq -r '.exitcode // 1')
@@ -165,7 +165,6 @@ parse_guest_config() {
 generate_markdown() {
   cat > "$TMP_MD" <<-EOF
 <!-- BEGIN_AUTO_NETWORK_INFO -->
-
 ---
 
 ### [Auto] network info
@@ -181,9 +180,8 @@ EOF
     props=$(sed 's/,/ /g' <<<"$line")
     bridge=$(grep -Po '(?<=bridge=)[^ ]+' <<<"$props" || echo '❌')
     vlan=$(grep -Po '(?<=tag=)[^ ]+'    <<<"$props" || echo '❌')
-    mac=$(grep -Po '(?<=virtio=|hwaddr=|mac=)[0-9A-Fa-f:]+' <<<"$props" | tr '[:upper:]' '[:lower:]')
 
-    entry=${guest_map[$mac]:-"_:false|"}
+    entry=${guest_map[$(grep -Po '(?<=virtio=|hwaddr=|mac=)[0-9A-Fa-f:]+' <<<"$props" | tr '[:upper:]' '[:lower:]')]:-"_:false|"}
     idf=${entry%%|*}
     has=${entry#*|}
     route_flag=$([[ "$has" == "true" ]] && echo '✅' || echo '❌')
@@ -198,17 +196,15 @@ filepath: $src
 \`\`\`text
 $(echo "${guest_content[$src]}" | sed 's/^/    /')
 \`\`\`
-
 </details>
-
 DETAIL
     fi
   done
 
   cat >> "$TMP_MD" <<-'EOF'
 ---
-
 <!-- END_AUTO_NETWORK_INFO -->
+---
 EOF
 }
 
@@ -217,7 +213,6 @@ parse_guest_config
 generate_markdown
 
 if (( APPLY == 1 )); then
-  # 공백 없이 TMP_MD 그대로 읽어들임
   NEW_SEC=$(cat "$TMP_MD")
 
   if grep -q '<!-- BEGIN_AUTO_NETWORK_INFO -->' <<<"$EXISTING"; then
