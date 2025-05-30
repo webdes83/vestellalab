@@ -13,7 +13,7 @@ Automates the setup of serial console (`xterm.js`) access for Proxmox VMs.
 Run the following command in your Proxmox shell:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/webdes83/vestellalab/proxmox/xterm_setup.sh)" <VMID>
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/webdes83/vestellalab/refs/heads/main/proxmox/xterm_setup.sh)" <VMID>
 ```
 
 Replace `<VMID>` with the ID of your virtual machine.
